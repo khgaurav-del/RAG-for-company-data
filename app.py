@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
+
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("USE_TF", "0")
 
@@ -14,6 +15,9 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 from transformers import pipeline
+
+import spacy
+nlp = spacy.load('en_core_web_md')
 
 try:
     from pymongo import ASCENDING, MongoClient, ReplaceOne
@@ -34,8 +38,8 @@ except Exception:
     ServerlessSpec = None
 
 
-GENERATOR_MODEL = os.getenv("GENERATOR_MODEL", "google/flan-t5-base")
-JUDGE_MODEL = os.getenv("JUDGE_MODEL", "google/flan-t5-large")
+GENERATOR_MODEL = os.getenv("GENERATOR_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
 
 def recursive_chunking(text: str, target_size: int = 800) -> List[str]:
@@ -58,6 +62,27 @@ def recursive_chunking(text: str, target_size: int = 800) -> List[str]:
             chunks.append(section.strip())
     return chunks
 
+
+def Semantic_chunking(text, max_chars=800):
+    try:
+       
+        doc = nlp(text)
+        sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+    except Exception:
+        # Fallback if spaCy model is unavailable
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if s.strip()]
+
+    chunks = []
+    current_chunk = ""
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) < max_chars:
+            current_chunk += sentence + " "
+        else:
+            chunks.append(current_chunk.strip())
+            current_chunk = sentence + " "
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+    return chunks
 
 def read_corpus_documents(corpus_path: str) -> List[Dict[str, str]]:
     path = Path(corpus_path)
@@ -107,7 +132,7 @@ def build_chunks(docs: List[Dict[str, str]]) -> List[Dict[str, str]]:
     chunks: List[Dict[str, str]] = []
     cid = 0
     for doc in docs:
-        local_chunks = recursive_chunking(doc["text"])
+        local_chunks = Semantic_chunking(doc["text"])
         for chunk_text in local_chunks:
             chunks.append({"id": f"ch_{cid}", "text": chunk_text, "source": doc["source"]})
             cid += 1
@@ -567,5 +592,6 @@ with gr.Blocks(title="RAG Assignment 3") as demo:
 
 
 if __name__ == "__main__":
+    print("Starting RAG QA system...")
     port = int(os.getenv("PORT", "7860"))
     demo.launch(server_name="0.0.0.0", server_port=port)
