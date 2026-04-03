@@ -14,10 +14,15 @@ import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-from transformers import pipeline
 
 import spacy
 nlp = spacy.load('en_core_web_md')
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+except Exception:
+    pass
 
 try:
     from pymongo import ASCENDING, MongoClient, ReplaceOne
@@ -37,9 +42,20 @@ except Exception:
     Pinecone = None
     ServerlessSpec = None
 
+try:
+    from groq import Groq
+except Exception:
+    Groq = None
 
-GENERATOR_MODEL = os.getenv("GENERATOR_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-JUDGE_MODEL = os.getenv("JUDGE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+
+GENERATOR_MODEL = os.getenv("GROQ_GENERATOR_MODEL", os.getenv("GENERATOR_MODEL", "llama-3.1-8b-instant"))
+JUDGE_MODEL = os.getenv("GROQ_JUDGE_MODEL", os.getenv("JUDGE_MODEL", "llama-3.3-70b-versatile"))
+CHUNKING_METHOD = os.getenv("CHUNKING_METHOD", "semantic").strip().lower() or "semantic"
+CHUNK_CACHE_VERSION = os.getenv("CHUNK_CACHE_VERSION", "v6")
+CHUNK_CACHE_DIR = Path(__file__).with_name("chunk_cache")
+CHUNK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+_MODEL_CACHE: Dict[str, Any] = {}
 
 
 def recursive_chunking(text: str, target_size: int = 800) -> List[str]:
@@ -110,12 +126,43 @@ def read_corpus_documents(corpus_path: str) -> List[Dict[str, str]]:
             if row_parts:
                 docs.append({"source": f"{fp}#row={idx}", "text": "\n".join(row_parts)})
 
+    def load_parquet_file(fp: Path) -> None:
+        try:
+            df = pd.read_parquet(fp)
+        except ImportError as exc:
+            raise ImportError("Reading parquet files requires 'pyarrow' or 'fastparquet'.") from exc
+
+        if len(df.columns) > 1:
+            # Matches notebook behavior: ignore likely index/id first column for parquet corpora.
+            df = df.iloc[:, 1:].copy()
+
+        text_cols = [
+            c
+            for c in df.columns
+            if pd.api.types.is_string_dtype(df[c]) or pd.api.types.is_object_dtype(df[c])
+        ]
+        if not text_cols:
+            text_cols = list(df.columns)
+
+        for idx, row in df.iterrows():
+            row_parts = []
+            for col in text_cols:
+                value = row.get(col, None)
+                if pd.notna(value):
+                    s = str(value).strip()
+                    if s:
+                        row_parts.append(f"{col}: {s}")
+            if row_parts:
+                docs.append({"source": f"{fp}#row={idx}", "text": "\n".join(row_parts)})
+
     if path.is_file():
         suffix = path.suffix.lower()
         if suffix in [".txt", ".md"]:
             load_text_file(path)
         elif suffix == ".csv":
             load_csv_file(path)
+        elif suffix == ".parquet":
+            load_parquet_file(path)
         return docs
 
     if path.is_dir():
@@ -124,6 +171,8 @@ def read_corpus_documents(corpus_path: str) -> List[Dict[str, str]]:
                 load_text_file(fp)
         for fp in path.rglob("*.csv"):
             load_csv_file(fp)
+        for fp in path.rglob("*.parquet"):
+            load_parquet_file(fp)
 
     return docs
 
@@ -137,6 +186,127 @@ def build_chunks(docs: List[Dict[str, str]]) -> List[Dict[str, str]]:
             chunks.append({"id": f"ch_{cid}", "text": chunk_text, "source": doc["source"]})
             cid += 1
     return chunks
+
+
+def get_cached_embedding_model(model_name: str):
+    cache_key = f"embedding::{model_name}"
+    model = _MODEL_CACHE.get(cache_key)
+    if model is None:
+        model = SentenceTransformer(model_name)
+        _MODEL_CACHE[cache_key] = model
+    return model
+
+
+def _corpus_signature(corpus_path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha1()
+    corpus_path = Path(corpus_path)
+
+    if corpus_path.is_file():
+        st = corpus_path.stat()
+        h.update(f"{corpus_path.resolve()}|{st.st_mtime_ns}|{st.st_size}".encode("utf-8"))
+        return h.hexdigest()[:12]
+
+    if corpus_path.is_dir():
+        supported = {".txt", ".md", ".csv", ".parquet"}
+        for fp in sorted(corpus_path.rglob("*")):
+            if fp.is_file() and fp.suffix.lower() in supported:
+                st = fp.stat()
+                h.update(f"{fp.resolve()}|{st.st_mtime_ns}|{st.st_size}".encode("utf-8"))
+        return h.hexdigest()[:12]
+
+    h.update(str(corpus_path).encode("utf-8"))
+    return h.hexdigest()[:12]
+
+
+def get_chunk_cache_path(corpus_path: str, chunking_method: str = "semantic") -> Path:
+    import hashlib
+
+    corpus_path_obj = Path(corpus_path)
+    corpus_name = corpus_path_obj.stem if corpus_path_obj.is_file() else corpus_path_obj.name
+    corpus_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", corpus_name or "corpus").strip("_").lower()
+    resolved = str(corpus_path_obj.resolve()) if corpus_path_obj.exists() else str(corpus_path_obj)
+    source_sig = _corpus_signature(corpus_path_obj)
+    chunk_cfg = f"{CHUNK_CACHE_VERSION}|{chunking_method}"
+    digest = hashlib.sha1(f"{resolved}|{source_sig}|{chunk_cfg}".encode("utf-8")).hexdigest()[:12]
+    return CHUNK_CACHE_DIR / f"{corpus_name}_{chunking_method}_{CHUNK_CACHE_VERSION}_{digest}.jsonl"
+
+
+def save_chunks_to_cache(chunks: List[Dict[str, str]], cache_path: Path) -> None:
+    import json
+
+    cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with cache_path.open("w", encoding="utf-8") as f:
+        for chunk in chunks:
+            chunk_id = str(chunk.get("id", "")).strip()
+            text = str(chunk.get("text", "")).strip()
+            source = str(chunk.get("source", "unknown")).strip() or "unknown"
+            if chunk_id and text:
+                record = {"id": chunk_id, "text": text, "source": source}
+                f.write(json.dumps(record, ensure_ascii=False))
+                f.write("\n")
+
+
+def load_chunks_from_cache(cache_path: Path) -> List[Dict[str, str]]:
+    import json
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return []
+
+    chunks: List[Dict[str, str]] = []
+    with cache_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            chunk_id = str(record.get("id", "")).strip()
+            text = str(record.get("text", "")).strip()
+            source = str(record.get("source", "unknown")).strip() or "unknown"
+            if chunk_id and text:
+                chunks.append({"id": chunk_id, "text": text, "source": source})
+
+    return chunks
+
+
+def get_semantic_cache_path(cache_path: Path) -> Path:
+    cache_path = Path(cache_path)
+    return cache_path.with_suffix(".semantic.npy")
+
+
+def save_semantic_embeddings_to_cache(embedding_matrix, semantic_cache_path: Path) -> None:
+    if embedding_matrix is None:
+        return
+    semantic_cache_path = Path(semantic_cache_path)
+    semantic_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(semantic_cache_path, embedding_matrix)
+
+
+def load_semantic_embeddings_from_cache(semantic_cache_path: Path, expected_rows: int | None = None):
+    semantic_cache_path = Path(semantic_cache_path)
+    if not semantic_cache_path.exists():
+        return None
+
+    try:
+        matrix = np.load(semantic_cache_path, allow_pickle=False)
+    except Exception:
+        return None
+
+    if not isinstance(matrix, np.ndarray) or matrix.ndim != 2:
+        return None
+
+    if expected_rows is not None and matrix.shape[0] != int(expected_rows):
+        return None
+
+    return matrix
 
 
 def get_mongo_collection():
@@ -192,7 +362,7 @@ def load_chunks_from_mongodb(collection, limit: int = 20000) -> List[Dict[str, s
 
 class HybridRetriever:
     def __init__(self, embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        self.embedding_model = SentenceTransformer(embedding_model_name)
+        self.embedding_model = get_cached_embedding_model(embedding_model_name)
         self.bm25_model = None
         self.bm25_chunks: List[Dict[str, Any]] = []
         self.local_chunk_matrix = None
@@ -200,18 +370,21 @@ class HybridRetriever:
         self.pc_index = None
         self.index_name = os.getenv("PINECONE_INDEX_NAME", "rag-assignment3-index")
 
-    def set_corpus(self, chunks: List[Dict[str, Any]]) -> None:
+    def set_corpus(self, chunks: List[Dict[str, Any]], semantic_matrix=None) -> None:
         self.bm25_chunks = chunks
         if BM25Okapi is not None:
             tokenized = [c["text"].lower().split() for c in chunks]
             self.bm25_model = BM25Okapi(tokenized)
-        vectors = self.embedding_model.encode([c["text"] for c in chunks], show_progress_bar=False)
-        self.local_chunk_matrix = np.array(vectors)
+        if semantic_matrix is not None and len(semantic_matrix) == len(chunks):
+            self.local_chunk_matrix = np.array(semantic_matrix)
+        else:
+            vectors = self.embedding_model.encode([c["text"] for c in chunks], show_progress_bar=False)
+            self.local_chunk_matrix = np.array(vectors)
 
     def try_init_pinecone(self) -> None:
         api_key = os.getenv("PINECONE_API_KEY")
         region = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
-        if not (Pinecone and api_key):
+        if not (Pinecone and ServerlessSpec and api_key):
             return
 
         try:
@@ -357,90 +530,130 @@ INSTRUCTIONS:
 """
 
 
-def generate_answer_hf(prompt: str, hf_model: str = GENERATOR_MODEL):
-    from huggingface_hub import InferenceClient
+def _resolve_groq_api_key() -> str:
+    return (
+        os.getenv("GROQ_API_KEY", "").strip()
+        or os.getenv("Groq_API_KEY", "").strip()
+    )
 
-    hf_token = os.getenv("HF_TOKEN")
-    candidate_models = [hf_model, "google/flan-t5-large", "bigscience/bloom-560m"]
+
+def get_cached_groq_client():
+    client = _MODEL_CACHE.get("groq_client")
+    if client is not None:
+        return client
+
+    api_key = _resolve_groq_api_key()
+    if not api_key or Groq is None:
+        return None
+
+    try:
+        client = Groq(api_key=api_key)
+        _MODEL_CACHE["groq_client"] = client
+        return client
+    except Exception:
+        return None
+
+
+def _dedupe_models(*models):
+    seen = set()
+    ordered = []
+    for m in models:
+        name = str(m or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    return ordered
+
+
+def _groq_chat_completion(prompt: str, model_name: str, max_tokens: int = 450, temperature: float = 0.2) -> str:
+    client = get_cached_groq_client()
+    if client is None:
+        raise RuntimeError("Groq client is not initialized. Set GROQ_API_KEY first.")
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a concise RAG assistant. Answer using only the provided context.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    if not response or not getattr(response, "choices", None):
+        return ""
+    msg = response.choices[0].message
+    return (msg.content or "").strip()
+
+
+def _clean_generated_answer(text: str) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text[:1800]
+
+
+def _extractive_fallback_answer(prompt: str, max_points: int = 6) -> str:
+    context_match = re.search(r"CONTEXT:\s*(.*?)\s*QUESTION:", prompt, re.DOTALL)
+    if not context_match:
+        return "Not found in provided context."
+
+    context_block = context_match.group(1).strip()
+    if not context_block:
+        return "Not found in provided context."
+
+    lines = [line.strip() for line in context_block.split("\n") if line.strip()]
+    picked = []
+    for line in lines:
+        if line.lower().startswith("source "):
+            source_part = line.split(":", 1)
+            if len(source_part) == 2 and source_part[1].strip():
+                picked.append(f"- {source_part[1].strip()}")
+        if len(picked) >= max_points:
+            break
+
+    if not picked:
+        return "Not found in provided context."
+    return "\n".join(picked)
+
+
+def generate_answer_hf(prompt: str, hf_model: str = GENERATOR_MODEL):
+    generator_model = hf_model or os.getenv("GROQ_GENERATOR_MODEL") or GENERATOR_MODEL
+    candidate_models = _dedupe_models(generator_model, "llama-3.1-8b-instant", "llama3-8b-8192")
     last_error = None
 
-    if hf_token and hf_token != "your_hf_token_here":
-        client = InferenceClient(provider="hf-inference", api_key=hf_token)
-        for model_name in candidate_models:
-            start = time.time()
-            try:
-                out = client.text_generation(prompt, model=model_name, max_new_tokens=300, temperature=0.2)
-                return out, time.time() - start
-            except Exception as e:
-                last_error = repr(e)
+    for model_name in candidate_models:
+        start = time.time()
+        try:
+            out = _groq_chat_completion(prompt, model_name=model_name, max_tokens=450, temperature=0.2)
+            return _clean_generated_answer(out), time.time() - start
+        except Exception as e:
+            last_error = repr(e)
 
-    global _local_gen_pipe
-    if "_local_gen_pipe" not in globals() or _local_gen_pipe is None:
-        _local_gen_pipe = pipeline("text-generation", model="distilgpt2")
-
-    local_prompt = prompt
-    try:
-        tok = _local_gen_pipe.tokenizer
-        max_positions = int(getattr(_local_gen_pipe.model.config, "n_positions", 1024))
-        max_input_tokens = max(64, max_positions - 120)
-        token_ids = tok.encode(prompt, add_special_tokens=False)
-        if len(token_ids) > max_input_tokens:
-            token_ids = token_ids[-max_input_tokens:]
-            local_prompt = tok.decode(token_ids, skip_special_tokens=True)
-    except Exception:
-        pass
-
-    start = time.time()
-    out = _local_gen_pipe(local_prompt, max_new_tokens=120, do_sample=False)
-    latency = time.time() - start
-    if isinstance(out, list) and out:
-        if "generated_text" in out[0]:
-            return out[0]["generated_text"], latency
-        return str(out[0]), latency
-
-    if last_error:
-        return f"Fallback output unavailable. Remote error: {last_error}", latency
-    return str(out), latency
+    extractive_answer = _extractive_fallback_answer(prompt, max_points=6)
+    if extractive_answer:
+        return extractive_answer, 0.0
+    return f"Groq generation failed: {last_error}", 0.0
 
 
 def call_hf_judge(prompt: str, model: str = JUDGE_MODEL) -> str:
-    from huggingface_hub import InferenceClient
+    judge_model = model or os.getenv("GROQ_JUDGE_MODEL") or JUDGE_MODEL
+    candidate_models = _dedupe_models(
+        judge_model,
+        os.getenv("GROQ_JUDGE_MODEL"),
+        os.getenv("GROQ_GENERATOR_MODEL"),
+        "llama-3.1-8b-instant",
+    )
+    last_error = None
 
-    hf_token = os.getenv("HF_TOKEN")
-    if hf_token and hf_token != "your_hf_token_here":
-        client = InferenceClient(provider="hf-inference", api_key=hf_token)
-        candidate_models = [
-            model,
-            "mistralai/Mistral-7B-Instruct-v0.3",
-            "meta-llama/Llama-3.1-8B-Instruct",
-            "google/flan-t5-large",
-        ]
-        for model_name in candidate_models:
-            try:
-                return client.text_generation(prompt, model=model_name, max_new_tokens=220, temperature=0.0)
-            except Exception:
-                continue
+    for model_name in candidate_models:
+        try:
+            return _groq_chat_completion(prompt[:4000], model_name=model_name, max_tokens=180, temperature=0.0)
+        except Exception as e:
+            last_error = repr(e)
 
-    global _local_judge_pipe
-    if "_local_judge_pipe" not in globals() or _local_judge_pipe is None:
-        _local_judge_pipe = pipeline("text-generation", model="distilgpt2")
-
-    local_prompt = prompt
-    try:
-        tok = _local_judge_pipe.tokenizer
-        max_positions = int(getattr(_local_judge_pipe.model.config, "n_positions", 1024))
-        max_input_tokens = max(64, max_positions - 80)
-        token_ids = tok.encode(prompt, add_special_tokens=False)
-        if len(token_ids) > max_input_tokens:
-            token_ids = token_ids[-max_input_tokens:]
-            local_prompt = tok.decode(token_ids, skip_special_tokens=True)
-    except Exception:
-        pass
-
-    out = _local_judge_pipe(local_prompt, max_new_tokens=80, do_sample=False)
-    if isinstance(out, list) and out and "generated_text" in out[0]:
-        return out[0]["generated_text"]
-    return str(out)
+    return f"Groq judge failed: {last_error}"
 
 
 def extract_claims(answer_text: str) -> List[str]:
@@ -500,33 +713,84 @@ def relevancy_score(original_query: str, answer_text: str, embedding_model: Sent
     return float(np.mean(sims))
 
 
-STATE: Dict[str, Any] = {"ready": False, "retriever": None, "chunks": []}
+STATE: Dict[str, Any] = {"ready": False, "retriever": None, "chunks": [], "docs": []}
 
 
 def ensure_pipeline_ready() -> None:
     if STATE["ready"]:
         return
 
-    default_corpus = Path(__file__).with_name("synthetic_knowledge_items.csv")
-    corpus_path = os.getenv("CORPUS_PATH", str(default_corpus))
+    app_dir = Path(__file__).resolve().parent
+    candidate_defaults = [
+        app_dir / "Mental_Health_" / "support_1000.parquet",
+        app_dir / "synthetic_knowledge_items.csv",
+    ]
+    default_corpus = next((p for p in candidate_defaults if p.exists()), candidate_defaults[-1])
+    corpus_path = (os.getenv("CORPUS_PATH", str(default_corpus)) or str(default_corpus)).strip()
+
+    force_rechunk = str(os.getenv("FORCE_RECHUNK", "false")).strip().lower() in {"1", "true", "yes", "y"}
+    load_docs_on_cache_hit = str(os.getenv("LOAD_DOCS_ON_CACHE_HIT", "false")).strip().lower() in {"1", "true", "yes", "y"}
+    upsert_on_cache_hit = str(os.getenv("UPSERT_ON_CACHE_HIT", "false")).strip().lower() in {"1", "true", "yes", "y"}
+
+    cache_path = get_chunk_cache_path(corpus_path, chunking_method=CHUNKING_METHOD)
+    semantic_cache_path = get_semantic_cache_path(cache_path)
+
+    chunks: List[Dict[str, str]] = []
+    docs: List[Dict[str, str]] = []
+    chunk_cache_hit = False
+
+    if not force_rechunk:
+        chunks = load_chunks_from_cache(cache_path)
+        chunk_cache_hit = len(chunks) > 0
+        if chunk_cache_hit:
+            print(f"Loaded {len(chunks)} chunks from cache: {cache_path}")
+            print("Reusing cached chunks. Skipping chunking step.")
 
     mongo_collection = get_mongo_collection()
-    chunks = load_chunks_from_mongodb(mongo_collection) if mongo_collection is not None else []
+    if not chunks and mongo_collection is not None:
+        chunks = load_chunks_from_mongodb(mongo_collection)
+        if chunks:
+            chunk_cache_hit = True
+            save_chunks_to_cache(chunks, cache_path)
+            print(f"Loaded {len(chunks)} chunks from MongoDB and saved local cache: {cache_path}")
 
     if not chunks:
         docs = read_corpus_documents(corpus_path)
         if not docs:
             raise ValueError(f"No documents found at CORPUS_PATH={corpus_path}")
         chunks = build_chunks(docs)
+        save_chunks_to_cache(chunks, cache_path)
         upsert_chunks_to_mongodb(mongo_collection, chunks)
+        print(f"Chunked corpus and saved {len(chunks)} chunks to cache: {cache_path}")
+    elif load_docs_on_cache_hit:
+        docs = read_corpus_documents(corpus_path)
+    else:
+        print("Skipping corpus read on cache hit for faster startup.")
 
     retriever = HybridRetriever()
-    retriever.set_corpus(chunks)
+
+    semantic_matrix = None
+    if not force_rechunk:
+        semantic_matrix = load_semantic_embeddings_from_cache(semantic_cache_path, expected_rows=len(chunks))
+        if semantic_matrix is not None:
+            print(f"Loaded semantic embedding matrix from cache: {semantic_cache_path.name}")
+
+    retriever.set_corpus(chunks, semantic_matrix=semantic_matrix)
+
+    if semantic_matrix is None and retriever.local_chunk_matrix is not None:
+        save_semantic_embeddings_to_cache(retriever.local_chunk_matrix, semantic_cache_path)
+        print(f"Saved semantic embedding matrix cache: {semantic_cache_path.name}")
+
     retriever.try_init_pinecone()
-    retriever.upsert_to_pinecone(chunks)
+    should_upsert = (not chunk_cache_hit) or bool(upsert_on_cache_hit)
+    if should_upsert:
+        retriever.upsert_to_pinecone(chunks)
+    else:
+        print("Skipping Pinecone upsert on cache hit for faster startup.")
 
     STATE["retriever"] = retriever
     STATE["chunks"] = chunks
+    STATE["docs"] = docs
     STATE["ready"] = True
 
 
@@ -568,7 +832,7 @@ def run_rag(query: str):
 with gr.Blocks(title="RAG Assignment 3") as demo:
     gr.Markdown("# RAG-based Question Answering System")
     gr.Markdown(
-        "Set environment variables: HF_TOKEN, GENERATOR_MODEL, JUDGE_MODEL, MONGODB_URI, MONGODB_DB, MONGODB_COLLECTION, PINECONE_API_KEY, PINECONE_ENVIRONMENT, CORPUS_PATH"
+        "Set environment variables: GROQ_API_KEY, GROQ_GENERATOR_MODEL, GROQ_JUDGE_MODEL, CORPUS_PATH, CHUNKING_METHOD, MONGODB_URI, MONGODB_DB, MONGODB_COLLECTION, PINECONE_API_KEY, PINECONE_ENVIRONMENT, FORCE_RECHUNK, LOAD_DOCS_ON_CACHE_HIT, UPSERT_ON_CACHE_HIT"
     )
 
     query_input = gr.Textbox(label="Ask a question", lines=2, placeholder="Type your question here...")
@@ -594,4 +858,10 @@ with gr.Blocks(title="RAG Assignment 3") as demo:
 if __name__ == "__main__":
     print("Starting RAG QA system...")
     port = int(os.getenv("PORT", "7860"))
-    demo.launch(server_name="0.0.0.0", server_port=port)
+    host = (os.getenv("HOST", "127.0.0.1") or "127.0.0.1").strip()
+    share = str(os.getenv("GRADIO_SHARE", "false")).strip().lower() in {"1", "true", "yes", "y"}
+
+    browser_host = "localhost" if host in {"0.0.0.0", "::"} else host
+    print(f"Open this URL in your browser: http://{browser_host}:{port}")
+
+    demo.launch(server_name=host, server_port=port, share=share)
