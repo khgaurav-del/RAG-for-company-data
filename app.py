@@ -48,14 +48,18 @@ except Exception:
     Groq = None
 
 
-GENERATOR_MODEL = os.getenv("GROQ_GENERATOR_MODEL", os.getenv("GENERATOR_MODEL", "llama-3.1-8b-instant"))
+GENERATOR_MODEL = os.getenv("GROQ_GENERATOR_MODEL", os.getenv("GENERATOR_MODEL", "deepseek-r1-distill-qwen-14b"))
 JUDGE_MODEL = os.getenv("GROQ_JUDGE_MODEL", os.getenv("JUDGE_MODEL", "llama-3.3-70b-versatile"))
+TRANSLATION_MODEL = os.getenv("GROQ_TRANSLATION_MODEL", os.getenv("TRANSLATION_MODEL", "llama-3.1-8b-instant"))
 CHUNKING_METHOD = os.getenv("CHUNKING_METHOD", "semantic").strip().lower() or "semantic"
 CHUNK_CACHE_VERSION = os.getenv("CHUNK_CACHE_VERSION", "v6")
 CHUNK_CACHE_DIR = Path(__file__).with_name("chunk_cache")
 CHUNK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 _MODEL_CACHE: Dict[str, Any] = {}
+
+URDU_CHAR_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]")
+LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
 
 
 def recursive_chunking(text: str, target_size: int = 800) -> List[str]:
@@ -594,6 +598,67 @@ def _clean_generated_answer(text: str) -> str:
     return text[:1800]
 
 
+def is_pure_urdu_text(text: str, min_urdu_ratio: float = 0.85) -> bool:
+    text = str(text or "").strip()
+    if not text:
+        return False
+
+    if LATIN_CHAR_RE.search(text):
+        return False
+
+    letters = [ch for ch in text if ch.isalpha()]
+    if not letters:
+        return False
+
+    urdu_letters = [ch for ch in letters if URDU_CHAR_RE.fullmatch(ch)]
+    ratio = len(urdu_letters) / max(1, len(letters))
+    return ratio >= min_urdu_ratio
+
+
+def _translate_text(text: str, source_lang: str, target_lang: str, enforce_pure_urdu: bool = False) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return text
+
+    model_name = os.getenv("GROQ_TRANSLATION_MODEL", "").strip() or TRANSLATION_MODEL or GENERATOR_MODEL
+    purity_rule = ""
+    if enforce_pure_urdu:
+        purity_rule = "- Output must be in Urdu script only. Do not use English words or Roman Urdu.\\n"
+
+    prompt = (
+        f"Translate the following {source_lang} text to {target_lang}.\\n"
+        "Rules:\\n"
+        "- Preserve meaning faithfully and keep tone natural.\\n"
+        "- Keep names, numbers, and dates unchanged when possible.\\n"
+        f"{purity_rule}"
+        "- Return only the translation text, without notes or quotes.\\n\\n"
+        f"Text:\\n{text}"
+    )
+
+    try:
+        translated = _groq_chat_completion(prompt, model_name=model_name, max_tokens=600, temperature=0.0)
+        translated = str(translated or "").strip()
+        if translated:
+            return translated
+    except Exception:
+        pass
+
+    return text
+
+
+def translate_urdu_to_english(text: str) -> str:
+    return _translate_text(text, source_lang="Urdu", target_lang="English")
+
+
+def translate_english_to_pure_urdu(text: str) -> str:
+    return _translate_text(
+        text,
+        source_lang="English",
+        target_lang="Urdu",
+        enforce_pure_urdu=True,
+    )
+
+
 def _extractive_fallback_answer(prompt: str, max_points: int = 6) -> str:
     context_match = re.search(r"CONTEXT:\s*(.*?)\s*QUESTION:", prompt, re.DOTALL)
     if not context_match:
@@ -816,12 +881,17 @@ def run_rag(query: str):
         ensure_pipeline_ready()
         retriever: HybridRetriever = STATE["retriever"]
 
-        retrieved = retriever.retrieve_hybrid(query, top_k=5)
-        prompt = create_rag_prompt(query, retrieved)
-        answer, _ = generate_answer_hf(prompt)
+        urdu_query = is_pure_urdu_text(query)
+        rag_query = translate_urdu_to_english(query) if urdu_query else query
 
-        faith = faithfulness_score(answer, retrieved)
-        relev = relevancy_score(query, answer, retriever.embedding_model)
+        retrieved = retriever.retrieve_hybrid(rag_query, top_k=5)
+        prompt = create_rag_prompt(rag_query, retrieved)
+        english_answer, _ = generate_answer_hf(prompt)
+
+        answer = translate_english_to_pure_urdu(english_answer) if urdu_query else english_answer
+
+        faith = faithfulness_score(english_answer, retrieved)
+        relev = relevancy_score(rag_query, english_answer, retriever.embedding_model)
 
         return answer, _format_context(retrieved), f"{faith:.3f}", f"{relev:.3f}"
     except Exception as e:
@@ -832,7 +902,7 @@ def run_rag(query: str):
 with gr.Blocks(title="RAG Assignment 3") as demo:
     gr.Markdown("# RAG-based Question Answering System")
     gr.Markdown(
-        "Set environment variables: GROQ_API_KEY, GROQ_GENERATOR_MODEL, GROQ_JUDGE_MODEL, CORPUS_PATH, CHUNKING_METHOD, MONGODB_URI, MONGODB_DB, MONGODB_COLLECTION, PINECONE_API_KEY, PINECONE_ENVIRONMENT, FORCE_RECHUNK, LOAD_DOCS_ON_CACHE_HIT, UPSERT_ON_CACHE_HIT"
+        "Set environment variables: GROQ_API_KEY, GROQ_GENERATOR_MODEL, GROQ_JUDGE_MODEL, GROQ_TRANSLATION_MODEL, CORPUS_PATH, CHUNKING_METHOD, MONGODB_URI, MONGODB_DB, MONGODB_COLLECTION, PINECONE_API_KEY, PINECONE_ENVIRONMENT, FORCE_RECHUNK, LOAD_DOCS_ON_CACHE_HIT, UPSERT_ON_CACHE_HIT"
     )
 
     query_input = gr.Textbox(label="Ask a question", lines=2, placeholder="Type your question here...")
