@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("USE_TF", "0")
 
@@ -927,11 +928,18 @@ with gr.Blocks(title="RAG Assignment 3") as demo:
 
 if __name__ == "__main__":
     print("Starting RAG QA system...")
-    port = int(os.getenv("PORT", "7860"))
-    host = (os.getenv("HOST", "127.0.0.1") or "127.0.0.1").strip()
-    share = str(os.getenv("GRADIO_SHARE", "false")).strip().lower() in {"1", "true", "yes", "y"}
+    
+    # Hugging Face uses port 7860 by default
+    port = int(os.getenv("PORT", 7860))
+    
+    # Force host to 0.0.0.0 so the Space can be accessed externally
+    host = "0.0.0.0" 
+    
+    print(f"Server is starting on {host}:{port}")
 
-    browser_host = "localhost" if host in {"0.0.0.0", "::"} else host
-    print(f"Open this URL in your browser: http://{browser_host}:{port}")
-
-    demo.launch(server_name=host, server_port=port, share=share)
+    # Launch Gradio
+    demo.launch(
+        server_name=host, 
+        server_port=port, 
+        share=False  # Keep share False on Hugging Face
+    )
