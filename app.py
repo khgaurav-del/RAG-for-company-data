@@ -927,11 +927,10 @@ with gr.Blocks(title="RAG Assignment 3") as demo:
 
 if __name__ == "__main__":
     print("Starting RAG QA system...")
-    port = int(os.getenv("PORT", "7860"))
-    host = (os.getenv("HOST", "127.0.0.1") or "127.0.0.1").strip()
-    share = str(os.getenv("GRADIO_SHARE", "false")).strip().lower() in {"1", "true", "yes", "y"}
-
-    browser_host = "localhost" if host in {"0.0.0.0", "::"} else host
-    print(f"Open this URL in your browser: http://{browser_host}:{port}")
-
-    demo.launch(server_name=host, server_port=port, share=share)
+    
+    # Simple, hardcoded for HF environment stability
+    demo.queue().launch(
+        server_name="0.0.0.0", 
+        server_port=7860,
+        show_error=True # This helps see errors in the browser
+    )
