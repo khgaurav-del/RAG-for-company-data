@@ -48,9 +48,9 @@ except Exception:
     Groq = None
 
 
-GENERATOR_MODEL = os.getenv("GROQ_GENERATOR_MODEL", os.getenv("GENERATOR_MODEL", "deepseek-r1-distill-qwen-14b"))
+GENERATOR_MODEL = os.getenv("GROQ_GENERATOR_MODEL", os.getenv("GENERATOR_MODEL", "llama-3.1-8b-instant"))
 JUDGE_MODEL = os.getenv("GROQ_JUDGE_MODEL", os.getenv("JUDGE_MODEL", "llama-3.3-70b-versatile"))
-TRANSLATION_MODEL = os.getenv("GROQ_TRANSLATION_MODEL", os.getenv("TRANSLATION_MODEL", "llama-3.1-8b-instant"))
+TRANSLATION_MODEL = os.getenv("GROQ_TRANSLATION_MODEL", os.getenv("TRANSLATION_MODEL", "deepseek-r1-distill-qwen-14b"))
 CHUNKING_METHOD = os.getenv("CHUNKING_METHOD", "semantic").strip().lower() or "semantic"
 CHUNK_CACHE_VERSION = os.getenv("CHUNK_CACHE_VERSION", "v6")
 CHUNK_CACHE_DIR = Path(__file__).with_name("chunk_cache")
