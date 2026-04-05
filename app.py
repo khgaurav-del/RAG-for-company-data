@@ -901,28 +901,22 @@ def run_rag(query: str):
 
 
 with gr.Blocks(title="RAG Assignment 3") as demo:
-    gr.Markdown("# RAG-based Question Answering System")
-    gr.Markdown(
-        "Set environment variables: GROQ_API_KEY, GROQ_GENERATOR_MODEL, GROQ_JUDGE_MODEL, GROQ_TRANSLATION_MODEL, CORPUS_PATH, CHUNKING_METHOD, MONGODB_URI, MONGODB_DB, MONGODB_COLLECTION, PINECONE_API_KEY, PINECONE_ENVIRONMENT, FORCE_RECHUNK, LOAD_DOCS_ON_CACHE_HIT, UPSERT_ON_CACHE_HIT"
-    )
+    gr.Markdown("# Personal psychiatric assistant (RAG QA System)")
 
     query_input = gr.Textbox(label="Ask a question", lines=2, placeholder="Type your question here...")
-    submit_btn = gr.Button("Generate Answer", variant="primary")
+    submit_btn = gr.Button("Ask RAG", variant="primary")
 
     answer_output = gr.Textbox(label="Generated Answer", lines=8)
-    context_output = gr.Textbox(label="Retrieved Context (Top Chunks)", lines=10)
-    faithfulness_output = gr.Textbox(label="Faithfulness Score")
-    relevancy_output = gr.Textbox(label="Relevancy Score")
 
     submit_btn.click(
         fn=run_rag,
         inputs=[query_input],
-        outputs=[answer_output, context_output, faithfulness_output, relevancy_output],
+        outputs=[answer_output],
     )
     query_input.submit(
         fn=run_rag,
         inputs=[query_input],
-        outputs=[answer_output, context_output, faithfulness_output, relevancy_output],
+        outputs=[answer_output],
     )
 
 
