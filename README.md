@@ -1,10 +1,7 @@
 ---
 title: NLP RAG Mental Health Support
 emoji: 🧠
-colorFrom: blue
-colorTo: green
 sdk: gradio
-sdk_version: 4.19.2
+sdk_version: 5.0.0  # Upgrade this
 app_file: app.py
-pinned: false
 ---
